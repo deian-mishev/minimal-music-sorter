@@ -40,7 +40,7 @@ export ROOT_FOLDER="/path/to/your/music/inbox"
 
 ## Application Structure
 
-Recommended folder structure for your music library:
+Sample folder structure for your music library:
 
 ```
 root_folder/
@@ -48,8 +48,9 @@ root_folder/
   Rock/
   Pop/
   Jazz/
-  Classical/
-  Electronic/
+  Cypress Hill/
+  Outkast/
+  Mobb Deep/
   ...
 ```
 
