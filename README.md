@@ -72,10 +72,6 @@ The service will monitor the inbox and organize files every minute.
 * Implement database storage for user history and statistics
 * Add unit and integration tests
 
-## License
-
-This project is open-source. Contributions are welcome.
-
 ## References
 
 - JAVA11: [https://www.oracle.com/java/technologies/javase-jdk11-downloads.html](https://www.oracle.com/java/technologies/javase-jdk11-downloads.html)
