@@ -10,23 +10,28 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 public class AiMusicSorter {
 
     private static final String GPT_PROMPT_TEMPLATE =
             """
-                    You are a smart music organizer. For each music file listed below, analyze the filename \
-                    to infer the possible song, band, album, or mood. Use this context to decide the most \
-                    appropriate folder AND suggest a new file name in the format: Artist - Song.
+                    You are a music-file organizer. For each filename in the list below, extract the most likely Artist and Song based only on the filename. Use this to choose the most appropriate folder from the allowed list and propose a cleaned filename in the format: Artist - Song.
                     
-                    Valid folder names:
+                    Available folders:
                     %s
                     
-                    Instructions:
-                    1. Respond ONLY in the format:
-                    original_filename → folder_name → new_filename
-                    2. Do not invent folders. If unsure about the folder, leave the file in the inbox.
+                    Rules:
+                    1. Respond strictly in the format:
+                       original_filename → folder_name → new_filename
                     
+                    Example:
+                       Old Song.mp3 → MyFolder → Artist - Track
+                    
+                    2. If a folder is not available then think of one based on the artist name
+                    3. new_filename must use the format: Artist - Song (with proper capitalization, without years, numbers, rip tags, quality tags, or extra symbols).
+                    4. Never output explanations, comments, or extra text.
+                 
                     Files:
                     %s""";
 
@@ -80,7 +85,7 @@ public class AiMusicSorter {
             String fname = file.getFileName().toString();
             FileMoveInfo targetInfo = decisions.get(fname);
 
-            if (targetInfo != null && validFolders.contains(targetInfo.folder)) {
+            if (targetInfo != null) {
                 Path targetFolder = root.resolve(targetInfo.folder);
                 if (!Files.exists(targetFolder)) {
                     Files.createDirectories(targetFolder);
@@ -90,22 +95,30 @@ public class AiMusicSorter {
                 int dotIndex = fname.lastIndexOf('.');
                 if (dotIndex >= 0) extension = fname.substring(dotIndex);
 
-                Path targetFile = targetFolder.resolve(targetInfo.newName + extension);
+                String cleanNewName = stripExtension(targetInfo.newName);
+                Path targetFile = targetFolder.resolve(cleanNewName + extension);
 
-                Files.move(file, targetFile, StandardCopyOption.REPLACE_EXISTING);
-
-                System.out.println("Moved & renamed " + fname + " → " + targetInfo.folder + "/" + targetFile.getFileName());
-            } else {
-                System.out.println("Left in inbox: " + fname + " (invalid folder or not recognized)");
+                try {
+                    Files.move(file, targetFile, StandardCopyOption.REPLACE_EXISTING);
+                    System.out.println("Moved & renamed " + fname + " → " + targetInfo.folder + "/" + targetFile.getFileName());
+                } catch (IOException ex) {
+                    System.err.println("Failed to move " + fname + ": " + ex.getMessage());
+                }
             }
         }
     }
 
     private List<Path> listInboxFiles() throws IOException {
         List<Path> files = new ArrayList<>();
+        int limit = 50;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(root)) {
             for (Path p : stream) {
-                if (Files.isRegularFile(p)) files.add(p);
+                if (Files.isRegularFile(p)) {
+                    if (!p.toString().toLowerCase().endsWith(".mp3")) continue;
+                    files.add(p);
+                    limit--;
+                }
+                if (limit < 0) break;
             }
         }
         return files;
@@ -113,6 +126,7 @@ public class AiMusicSorter {
 
     private List<String> listValidFolders() throws IOException {
         List<String> folders = new ArrayList<>();
+
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(root)) {
             for (Path p : stream) {
                 if (Files.isDirectory(p)) {
@@ -126,8 +140,8 @@ public class AiMusicSorter {
     private Map<String, FileMoveInfo> askChatGPTBatch(List<Path> files, Set<String> validFolders) {
         String folderList = String.join("\n", validFolders);
         String fileList = files.stream()
-                .map(f -> "- " + f.getFileName())
-                .reduce("", (a, b) -> a + "\n" + b);
+                .map(f -> f.getFileName().toString())
+                .collect(Collectors.joining("\n"));
 
         String prompt = String.format(
                 GPT_PROMPT_TEMPLATE,
@@ -135,7 +149,7 @@ public class AiMusicSorter {
         );
 
         ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
-                .model(ChatModel.GPT_4_TURBO)
+                .model(ChatModel.GPT_4_1)
                 .addUserMessage(prompt)
                 .build();
 
@@ -146,18 +160,21 @@ public class AiMusicSorter {
         for (String line : reply.split("\n")) {
             if (!line.contains("→")) continue;
             String[] parts = line.split("→");
-            if (parts.length < 3) continue;
+            if (parts.length != 3) continue;
 
-            String original = parts[0].trim();
-            String folder = parts[1].trim();
-            String newName = parts[2].trim();
+            String original = parts[0].replace("\"", "").trim();
+            String folder = parts[1].replace("\"", "").trim();
+            String newName = parts[2].replace("\"", "").trim();
 
-            if (validFolders.contains(folder)) {
-                map.put(original, new FileMoveInfo(original, folder, newName));
-            }
+            map.put(original, new FileMoveInfo(original, folder, newName));
         }
 
         return map;
+    }
+
+    private String stripExtension(String name) {
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
     }
 
     public static void main(String[] args) {
