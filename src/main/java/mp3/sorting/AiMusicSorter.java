@@ -5,35 +5,39 @@ import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.models.ChatModel;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import org.jaudiotagger.audio.AudioFileIO;
+import org.jaudiotagger.audio.mp3.MP3File;
+import org.jaudiotagger.tag.FieldKey;
+import org.jaudiotagger.tag.Tag;
+import org.jaudiotagger.tag.id3.ID3v24Tag;
 
 import java.io.IOException;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
-import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 public class AiMusicSorter {
 
-    private static final String GPT_PROMPT_TEMPLATE =
-            """
-                    You are a music-file organizer. For each filename in the list below, extract the most likely Artist and Song based only on the filename. Use this to choose the most appropriate folder from the allowed list and propose a cleaned filename in the format: Artist - Song.
-                    
-                    Available folders:
-                    %s
-                    
-                    Rules:
-                    1. Respond strictly in the format:
-                       original_filename → folder_name → new_filename
-                    
-                    Example:
-                       Old Song.mp3 → MyFolder → Artist - Track
-                    
-                    2. If a folder is not available then think of one based on the artist name
-                    3. new_filename must use the format: Artist - Song (with proper capitalization, without years, numbers, rip tags, quality tags, or extra symbols).
-                    4. Never output explanations, comments, or extra text.
-                 
-                    Files:
-                    %s""";
+    private static final String GPT_PROMPT_TEMPLATE = """
+            You are a music-file organizer. For each filename in the list below, extract the most likely Artist and Song based only on the filename. Use this to choose the most appropriate folder from the allowed list and propose a cleaned filename in the format: Artist - Song.
+            
+            Available folders:
+            %s
+            
+            Rules:
+            1. Respond strictly in the format:
+               original_filename → folder_name → new_filename
+            
+            Example:
+               Old Song.mp3 → MyFolder → Artist - Track
+            
+            2. If a folder is not available then think of one based on the artist name
+            3. new_filename must use the format: Artist - Song (with proper capitalization, without years, numbers, rip tags, quality tags, or extra symbols).
+            4. Never output explanations, comments, or extra text.
+            
+            Files:
+            %s""";
 
     private final Path root;
     private final OpenAIClient client;
@@ -46,27 +50,83 @@ public class AiMusicSorter {
             throw new IllegalStateException("Environment variable OPENAI_API_KEY is not set!");
         }
 
-        client = OpenAIOkHttpClient.builder()
-                .apiKey(apiKey)
-                .build();
+        client = OpenAIOkHttpClient.builder().apiKey(apiKey).build();
     }
 
-    public void start() {
+    public void start() throws Exception {
         if (!Files.isDirectory(root)) {
             throw new IllegalStateException("Inbox folder does not exist: " + root);
         }
 
         System.out.println("Starting batch sorter on root: " + root);
 
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
 
-        executor.scheduleAtFixedRate(() -> {
-            try {
-                processInboxBatch();
-            } catch (Exception e) {
-                e.printStackTrace();
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+
+                if (file.toString().toLowerCase().endsWith(".mp3")) {
+                    try {
+                        fixMp3(file);
+                    } catch (Exception e) {
+                        System.err.println("Error handling " + file + ": " + e.getMessage());
+                    }
+                }
+
+                return FileVisitResult.CONTINUE;
             }
-        }, 0, 1, TimeUnit.MINUTES);
+        });
+
+        processInboxBatch();
+    }
+
+    private static void fixMp3(Path file) throws Exception {
+        Path parent = file.getParent();
+        String folderName = parent.getFileName().toString();
+
+        String fixedName = file.getFileName().toString().replaceAll("(?i)\\.mp3$", "");
+        fixedName = fixedName + ".mp3";
+
+        Path fixedFile = parent.resolve(fixedName);
+
+        if (!file.equals(fixedFile)) {
+            Files.move(file, fixedFile, StandardCopyOption.REPLACE_EXISTING);
+            file = fixedFile;
+        }
+        String baseName = fixedName.replace(".mp3", "");
+        String title;
+        if (baseName.contains(" - ")) {
+            title = baseName.substring(baseName.indexOf(" - ") + 3).trim();
+        } else {
+            title = baseName;
+        }
+
+        MP3File mp3File = (MP3File) AudioFileIO.read(file.toFile());
+
+        Tag tag = mp3File.getTag();
+        if (tag != null) {
+            for (FieldKey fieldKey : FieldKey.values()) {
+                tag.deleteField(fieldKey);
+            }
+        }
+        mp3File.setID3v1Tag(null);
+        mp3File.setID3v2Tag(null);
+
+        Tag newTag = new ID3v24Tag();
+        newTag.setField(FieldKey.ARTIST, folderName);
+        newTag.setField(FieldKey.ALBUM, folderName);
+        newTag.setField(FieldKey.TITLE, title);
+        mp3File.setTag(newTag);
+        mp3File.commit();
+
+        String newName = folderName + " - " + title + ".mp3";
+        Path renamed = parent.resolve(newName);
+
+        if (!fixedFile.equals(renamed)) {
+            Files.move(fixedFile, renamed, StandardCopyOption.REPLACE_EXISTING);
+        }
+
+        System.out.println("Updated: " + renamed);
     }
 
     private void processInboxBatch() throws Exception {
@@ -139,19 +199,11 @@ public class AiMusicSorter {
 
     private Map<String, FileMoveInfo> askChatGPTBatch(List<Path> files, Set<String> validFolders) {
         String folderList = String.join("\n", validFolders);
-        String fileList = files.stream()
-                .map(f -> f.getFileName().toString())
-                .collect(Collectors.joining("\n"));
+        String fileList = files.stream().map(f -> f.getFileName().toString()).collect(Collectors.joining("\n"));
 
-        String prompt = String.format(
-                GPT_PROMPT_TEMPLATE,
-                folderList, fileList
-        );
+        String prompt = String.format(GPT_PROMPT_TEMPLATE, folderList, fileList);
 
-        ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
-                .model(ChatModel.GPT_4_1)
-                .addUserMessage(prompt)
-                .build();
+        ChatCompletionCreateParams params = ChatCompletionCreateParams.builder().model(ChatModel.GPT_4_1).addUserMessage(prompt).build();
 
         ChatCompletion response = client.chat().completions().create(params);
         String reply = response.choices().getFirst().message().content().orElse("");
@@ -177,7 +229,7 @@ public class AiMusicSorter {
         return dot > 0 ? name.substring(0, dot) : name;
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         String folder = System.getenv("ROOT_FOLDER");
 
         if (folder == null || folder.isBlank()) {
